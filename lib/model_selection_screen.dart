@@ -111,7 +111,8 @@ class _ModelSelectionScreenState extends State<ModelSelectionScreen> {
       body: Padding(
         padding: EdgeInsets.fromLTRB(
           16,
-          MediaQuery.of(context).padding.top + kToolbarHeight + 64,
+          // Just enough to clear the parent AppBar (preferredSize 112) + small breathing room.
+          MediaQuery.of(context).padding.top + 116,
           16,
           MediaQuery.of(context).padding.bottom + 16,
         ),
@@ -119,7 +120,7 @@ class _ModelSelectionScreenState extends State<ModelSelectionScreen> {
           children: [
             // Filters section
             Container(
-              margin: const EdgeInsets.only(bottom: 16.0),
+              margin: const EdgeInsets.only(bottom: 6.0),
               child: Column(
                 children: [
                   // Filter header
@@ -243,7 +244,7 @@ class _ModelSelectionScreenState extends State<ModelSelectionScreen> {
             ),
             // Sort selector
             Container(
-              margin: const EdgeInsets.only(bottom: 16.0),
+              margin: const EdgeInsets.only(bottom: 6.0),
               child: Row(
                 children: [
                   const Text(
@@ -286,7 +287,7 @@ class _ModelSelectionScreenState extends State<ModelSelectionScreen> {
             ),
             // Results counter
             Container(
-              margin: const EdgeInsets.only(bottom: 12.0),
+              margin: const EdgeInsets.only(bottom: 4.0),
               child: Text(
                 'Showing ${models.length} ${_getModelsWord(models.length)}',
                 style: TextStyle(
@@ -340,7 +341,7 @@ class _ModelCardState extends State<ModelCard> {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: const EdgeInsets.only(bottom: 12.0),
+      padding: const EdgeInsets.only(bottom: 8.0),
       child: ClipRRect(
         borderRadius: BorderRadius.circular(20),
         child: BackdropFilter(

@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:objectbox/objectbox.dart';
+import '../services/memory_guard.dart';
 import '../services/notification_service.dart';
 import '../services/educational_tool_service.dart';
 import '../models/entities.dart';
@@ -97,18 +98,18 @@ class StudyMaterialService {
   }) async {
     // Tool-call types (quiz, flashcards) need headroom for the schema +
     // structured response, so we pull fewer RAG chunks to keep the prompt
-    // small. The schema itself adds ~200 tokens of overhead.
+    // small. MemoryGuard further tightens these on lean (6 GB) devices.
     final bool isToolCallType = type == 'quiz' || type == 'flashcards';
-    final ragChunks = isToolCallType
-        ? (count >= 10 ? 6 : 4)
-        : ((count >= 15) ? 16 : (count >= 10 ? 12 : 10));
+    final ragChunks = MemoryGuard.instance
+        .ragChunksForGeneration(count: count, toolCall: isToolCallType);
     final chunks = await _ragService.searchByCategory(
       "General overview of ${category.name}",
       category.id,
       maxResults: ragChunks,
     );
 
-    final context = chunks.map((c) => c.text).join("\n\n");
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join("\n\n"));
     if (context.trim().isEmpty) {
       throw 'I couldn\'t find any information about "${category.name}" in your library.';
     }
@@ -193,8 +194,8 @@ $context""";
     final prompt = await buildPrompt(category: category, type: type, count: count, difficulty: difficulty);
     final isolatedPrompt = "IMPORTANT: Focus ONLY on this new request. Ignore any previous context.\n\n$prompt";
 
-    final int maxTokens = count >= 15 ? 4096 : 2560;
-    final model = await FlutterGemma.getActiveModel(maxTokens: maxTokens);
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
     final chat = await model.createChat(temperature: 0.1);
     String rawText = "";
     try {
@@ -1173,9 +1174,10 @@ $context""";
     final chunks = await _ragService.searchByCategory(
       'Comprehensive overview of ${category.name} for a structured course',
       category.id,
-      maxResults: 5,
+      maxResults: MemoryGuard.instance.ragChunksForLookup,
     );
-    final context = chunks.map((c) => c.text).join('\n\n');
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join('\n\n'));
 
     // Plain English instruction. The schema is enforced by the
     // create_workshop_outline TOOL — the model literally cannot emit
@@ -1192,7 +1194,8 @@ Call the create_workshop_outline tool with the outline. Every lesson needs a tit
 Context:
 $context''';
 
-    final model = await FlutterGemma.getActiveModel(maxTokens: 4096);
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
     final chat = await model.createChat(
       temperature: 0.1,
       supportsFunctionCalls: true,
@@ -1282,9 +1285,10 @@ $context''';
     final chunks = await _ragService.searchByCategory(
       query,
       workshop.category.target?.id ?? 0,
-      maxResults: 5,
+      maxResults: MemoryGuard.instance.ragChunksForLookup,
     );
-    final context = chunks.map((c) => c.text).join('\n\n');
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join('\n\n'));
 
     final prompt = '''You are writing one lesson in a structured workshop on "$categoryName" (overall difficulty: $depthLabel).
 
@@ -1310,7 +1314,8 @@ Context:
 $context''';
 
     // 4096 tokens of headroom — prompt is now small, response can be long.
-    final model = await FlutterGemma.getActiveModel(maxTokens: 4096);
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
     final chat = await model.createChat(temperature: 0.1);
     String fullBody = '';
     try {
@@ -1349,7 +1354,8 @@ Lesson Title: $lessonTitle
 Content:
 $lessonBody''';
 
-    final model = await FlutterGemma.getActiveModel(maxTokens: 4096);
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
     final chat = await model.createChat(
       temperature: 0.1,
       supportsFunctionCalls: true,

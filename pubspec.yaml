@@ -38,6 +38,7 @@ dependencies:
   shelf: ^1.4.1
   shelf_router: ^1.1.4
   network_info_plus: ^6.0.0
+  system_info_plus: ^0.0.5
   qr_flutter: ^4.1.0
   mobile_scanner: ^5.1.1
 

@@ -258,6 +258,10 @@ class EducationalToolService {
       tokenBuffer: 512,
       supportsFunctionCalls: true,
       tools: educationalTools,
+      // Enable Gemma 4's reasoning channel. Thinking tokens stream as
+      // ThinkingResponse and we render them in a collapsible panel above
+      // the answer bubble (see GlassThinkingPanel).
+      isThinking: true,
     );
   }
 }

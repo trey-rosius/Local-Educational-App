@@ -20,20 +20,22 @@ Everything is built in Flutter + Dart, with native Gemma 4 inference via the `fl
 
 ## Demo
 
-*(video walkthrough coming soon)*
+Watch the walkthrough on YouTube: **https://youtu.be/dVYz8xq2L_8**
+
+{% embed https://youtu.be/dVYz8xq2L_8 %}
 
 ## Code
 
-Full source: **https://github.com/trey-rosius/-an-offline-educational-app**
+Full source: **https://github.com/trey-rosius/Local-Educational-App**
 
 Key directories to explore:
 
-- [`lib/services/educational_tool_service.dart`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/lib/services/educational_tool_service.dart) — all 8 function-call schemas (quiz, flashcards, workshop, plus 5 interactive tutor tools).
-- [`lib/services/study_material_service.dart`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/lib/services/study_material_service.dart) — generation entry points + the JSON repair pipeline + semantic validators.
-- [`lib/services/rag_service.dart`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/lib/services/rag_service.dart) — PDF/image ingestion, batched embedding, HNSW search.
-- [`lib/services/background_generation_service.dart`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/lib/services/background_generation_service.dart) — the non-blocking task queue that branches between tool-call and text-mode paths.
-- [`architecture.excalidraw`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/architecture.excalidraw) — full visual architecture diagram (open at https://excalidraw.com).
-- [`README.md`](https://github.com/trey-rosius/-an-offline-educational-app/blob/master/README.md) — complete feature + architecture + failure-mode documentation.
+- [`lib/services/educational_tool_service.dart`](https://github.com/trey-rosius/Local-Educational-App/blob/master/lib/services/educational_tool_service.dart) — all 8 function-call schemas (quiz, flashcards, workshop, plus 5 interactive tutor tools).
+- [`lib/services/study_material_service.dart`](https://github.com/trey-rosius/Local-Educational-App/blob/master/lib/services/study_material_service.dart) — generation entry points + the JSON repair pipeline + semantic validators.
+- [`lib/services/rag_service.dart`](https://github.com/trey-rosius/Local-Educational-App/blob/master/lib/services/rag_service.dart) — PDF/image ingestion, batched embedding, HNSW search.
+- [`lib/services/background_generation_service.dart`](https://github.com/trey-rosius/Local-Educational-App/blob/master/lib/services/background_generation_service.dart) — the non-blocking task queue that branches between tool-call and text-mode paths.
+- [`architecture.excalidraw`](https://github.com/trey-rosius/Local-Educational-App/blob/master/architecture.excalidraw) — full visual architecture diagram (open at https://excalidraw.com).
+- [`README.md`](https://github.com/trey-rosius/Local-Educational-App/blob/master/README.md) — complete feature + architecture + failure-mode documentation.
 
 ## How I Used Gemma 4
 

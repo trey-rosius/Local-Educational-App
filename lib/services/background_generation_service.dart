@@ -5,6 +5,7 @@ import '../models/entities.dart';
 import '../services/objectbox_manager.dart';
 import 'dart:convert';
 
+import '../services/memory_guard.dart';
 import '../services/notification_service.dart';
 import '../services/study_material_service.dart';
 import '../services/educational_tool_service.dart';
@@ -110,9 +111,10 @@ class BackgroundGenerationService extends ChangeNotifier {
         }
       }
 
-      // 4096 maxTokens to fit large RAG prompts + multi-question JSON
-      // responses; 2048 silently exhausts the context on real quizzes.
-      final model = await FlutterGemma.getActiveModel(maxTokens: 4096);
+      // maxTokens comes from MemoryGuard — 4096 on desktop, 3072 in Lean
+      // Memory Mode (default on 6 GB devices like iPhone 13 Pro Max).
+      final model = await FlutterGemma
+          .getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
 
       // Structured types use tool calling — the flutter_gemma runtime
       // constrains generation at the token level so the model literally
@@ -161,7 +163,6 @@ class BackgroundGenerationService extends ChangeNotifier {
       // in saveMaterial sort it out. This is the same path non-tool types
       // use, so we always get *some* result rather than a silent failure.
       String? content;
-      bool toolCallEngaged = false;
       if (structuredTool != null) {
         Map<String, dynamic>? args;
         if (response is FunctionCallResponse &&
@@ -177,7 +178,6 @@ class BackgroundGenerationService extends ChangeNotifier {
         }
         if (args != null) {
           content = jsonEncode(args);
-          toolCallEngaged = true;
           debugPrint('BG: tool call SUCCEEDED for ${nextTask.type}');
         } else if (response is TextResponse && response.token.isNotEmpty) {
           // Model ignored ToolChoice.required and emitted free-form text.
