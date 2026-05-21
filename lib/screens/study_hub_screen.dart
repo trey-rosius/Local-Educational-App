@@ -16,6 +16,8 @@ import 'package:http/http.dart' as http;
 import '../services/tts_service.dart';
 import '../main.dart';
 import '../utils/json_utils.dart';
+import '../services/background_generation_service.dart';
+import '../services/background_ingestion_service.dart';
 
 class StudyHubScreen extends StatefulWidget {
   final SubjectCategory category;
@@ -39,14 +41,72 @@ class _StudyHubScreenState extends State<StudyHubScreen> {
   final TtsService _ttsService = TtsService();
   final KnowledgeShareService _shareService = KnowledgeShareService();
 
+  // Track which failed task IDs we've already surfaced so the snackbar
+  // doesn't keep re-firing on every notifyListeners() tick.
+  final Set<String> _surfacedFailureIds = <String>{};
+
   @override
   void initState() {
     super.initState();
     _loadMaterials();
+    BackgroundGenerationService().addListener(_onTasksChanged);
+    BackgroundIngestionService().addListener(_onTasksChanged);
+  }
+
+  void _onTasksChanged() {
+    if (!mounted) return;
+    _loadMaterials();
+    // Surface any newly-failed generation tasks. Without this the spinner
+    // just silently disappears when a task fails and the user has no idea
+    // what went wrong.
+    for (final task in BackgroundGenerationService().tasks) {
+      if (task.status == GenerationStatus.failed &&
+          !_surfacedFailureIds.contains(task.id)) {
+        _surfacedFailureIds.add(task.id);
+        final msg = task.errorMessage ?? 'Generation failed.';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Could not generate ${task.type} "${task.title}":\n$msg',
+            ),
+            duration: const Duration(seconds: 12),
+            action: SnackBarAction(
+              label: 'Details',
+              onPressed: () {
+                showDialog<void>(
+                  context: context,
+                  builder: (ctx) => AlertDialog(
+                    title: Text('Generation failed: ${task.type}'),
+                    content: SingleChildScrollView(
+                      child: SelectableText(
+                        msg,
+                        style: const TextStyle(
+                            fontFamily: 'monospace', fontSize: 12),
+                      ),
+                    ),
+                    actions: [
+                      TextButton(
+                        onPressed: () {
+                          BackgroundGenerationService().removeTask(task.id);
+                          Navigator.pop(ctx);
+                        },
+                        child: const Text('Dismiss'),
+                      ),
+                    ],
+                  ),
+                );
+              },
+            ),
+          ),
+        );
+      }
+    }
   }
 
   @override
   void dispose() {
+    BackgroundGenerationService().removeListener(_onTasksChanged);
+    BackgroundIngestionService().removeListener(_onTasksChanged);
     _ttsService.stop();
     _shareService.stopBroadcasting();
     super.dispose();
@@ -72,28 +132,37 @@ class _StudyHubScreenState extends State<StudyHubScreen> {
     int count = 10,
     QuizDifficulty difficulty = QuizDifficulty.medium,
   }) async {
-    setState(() => _isGenerating = true);
     try {
-      await widget.materialService.generateAndSaveMaterial(
+      final prompt = await widget.materialService.buildPrompt(
         category: widget.category,
         type: type,
         count: count,
         difficulty: difficulty,
       );
-      _loadMaterials();
+
+      String? autoTitle;
+      if (type == 'quiz') autoTitle = '${widget.category.name} · ${difficulty.label} · $count Q';
+      else if (type == 'flashcards') autoTitle = '${widget.category.name} · $count cards';
+
+      BackgroundGenerationService().addTask(
+        type: type,
+        prompt: prompt,
+        title: autoTitle ?? type.toUpperCase(),
+        categoryId: widget.category.id,
+        materialService: widget.materialService,
+      );
+
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Successfully generated $type!')),
+          SnackBar(content: Text('Generation task for $type added to background!')),
         );
       }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Generation error: $e')),
+          SnackBar(content: Text('Error queuing task: $e')),
         );
       }
-    } finally {
-      if (mounted) setState(() => _isGenerating = false);
     }
   }
 
@@ -181,16 +250,18 @@ class _StudyHubScreenState extends State<StudyHubScreen> {
     );
 
     if (result != null && result.files.single.path != null) {
-      setState(() => _isGenerating = true);
       try {
-        await widget.ragService.ingestDocument(
-          file: result.files.single,
-          category: widget.category,
-          onProgress: (p, t) => debugPrint("Ingestion: $p/$t"),
+        final filePath = await widget.ragService.savePdfToDevice(result.files.single, widget.category);
+        
+        BackgroundIngestionService().addIngestionTask(
+          filePath: filePath,
+          fileName: result.files.single.name,
+          categoryId: widget.category.id,
         );
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Document added to this subject!')),
+            const SnackBar(content: Text('Document ingestion added to background!')),
           );
         }
       } catch (e) {
@@ -199,8 +270,6 @@ class _StudyHubScreenState extends State<StudyHubScreen> {
             SnackBar(content: Text('Error adding document: $e')),
           );
         }
-      } finally {
-        if (mounted) setState(() => _isGenerating = false);
       }
     }
   }
@@ -391,19 +460,64 @@ class _StudyHubScreenState extends State<StudyHubScreen> {
                       ),
                     ),
                   ),
-                  if (_isGenerating)
-                    const Center(
+                  ListenableBuilder(
+                    listenable: BackgroundGenerationService(),
+                    builder: (context, _) {
+                      if (!BackgroundGenerationService().hasActiveTasks) return const SizedBox.shrink();
+                      return Center(
                         child: Padding(
-                      padding: EdgeInsets.symmetric(horizontal: 16.0),
-                      child: SizedBox(
-                          width: 20,
-                          height: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(
-                                Colors.white),
-                          )),
-                    )),
+                          padding: const EdgeInsets.symmetric(horizontal: 16.0),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                '${BackgroundGenerationService().tasks.where((t) => t.status == GenerationStatus.processing || t.status == GenerationStatus.pending).length} active',
+                                style: const TextStyle(color: Colors.white, fontSize: 8),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                  ListenableBuilder(
+                    listenable: BackgroundIngestionService(),
+                    builder: (context, _) {
+                      if (!BackgroundIngestionService().hasActiveTasks) return const SizedBox.shrink();
+                      return Center(
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 4.0),
+                          child: Column(
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              const SizedBox(
+                                width: 20,
+                                height: 20,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  valueColor: AlwaysStoppedAnimation<Color>(Colors.greenAccent),
+                                ),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                'Ingesting',
+                                style: TextStyle(color: Colors.greenAccent.withOpacity(0.8), fontSize: 7),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
                   const SizedBox(width: 8),
                 ],
               ),

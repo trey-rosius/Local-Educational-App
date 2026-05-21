@@ -17,7 +17,7 @@ class _EmbeddingModelsScreenState extends State<EmbeddingModelsScreen> {
       body: Padding(
         padding: EdgeInsets.fromLTRB(
           16,
-          MediaQuery.of(context).padding.top + kToolbarHeight + 64,
+          MediaQuery.of(context).padding.top + 116,
           16,
           MediaQuery.of(context).padding.bottom + 16,
         ),

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'screens/main_navigation_screen.dart';
+import 'services/memory_guard.dart';
+import 'services/notification_service.dart';
 import 'services/objectbox_manager.dart';
 import 'services/usage_tracking_service.dart';
 
@@ -9,8 +11,14 @@ late UsageTrackingService usageTracker;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.init();
   objectBox = await ObjectBox.create();
   usageTracker = UsageTrackingService(objectBox.store);
+
+  // Load Lean Memory Mode preference. On mobile this defaults ON so the
+  // first run on a 6 GB device (iPhone 13 Pro Max, mid-range Android)
+  // already runs with tighter token budgets.
+  await MemoryGuard.instance.initialize();
 
   await FlutterGemma.initialize(webStorageMode: WebStorageMode.cacheApi);
 

@@ -1,11 +1,16 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:objectbox/objectbox.dart';
+import '../services/memory_guard.dart';
+import '../services/notification_service.dart';
+import '../services/educational_tool_service.dart';
 import '../models/entities.dart';
 import 'rag_service.dart';
 import '../objectbox.g.dart';
 import '../models/model.dart';
 import '../utils/json_utils.dart';
+import '../main.dart';
 
 /// User-selectable workshop depth.
 enum WorkshopDepth {
@@ -85,203 +90,240 @@ class StudyMaterialService {
     }
   }
 
-  /// Generates a study material (quiz, summary, flashcards, mind_map) for a
-  /// category and persists it to ObjectBox.
-  ///
-  /// [count] applies to `'quiz'` and `'flashcards'` types — defaults to 10.
-  /// [difficulty] only applies to `'quiz'` — defaults to medium.
-  Future<GeneratedStudyMaterial> generateAndSaveMaterial({
+  Future<String> buildPrompt({
     required SubjectCategory category,
-    required String type, // 'quiz', 'summary', 'flashcards', 'mind_map'
+    required String type,
     int count = 10,
     QuizDifficulty difficulty = QuizDifficulty.medium,
   }) async {
-    // Ensure model is ready
-    await _ensureModelActive();
-
-    // 1. Get RAG context for the entire category. Pull a few more chunks
-    // for larger generations so the model has more material to work with.
-    final ragChunks = (count >= 15) ? 16 : (count >= 10 ? 12 : 10);
+    // Tool-call types (quiz, flashcards) need headroom for the schema +
+    // structured response, so we pull fewer RAG chunks to keep the prompt
+    // small. MemoryGuard further tightens these on lean (6 GB) devices.
+    final bool isToolCallType = type == 'quiz' || type == 'flashcards';
+    final ragChunks = MemoryGuard.instance
+        .ragChunksForGeneration(count: count, toolCall: isToolCallType);
     final chunks = await _ragService.searchByCategory(
       "General overview of ${category.name}",
       category.id,
       maxResults: ragChunks,
     );
 
-    final context = chunks.map((c) => c.text).join("\n\n");
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join("\n\n"));
     if (context.trim().isEmpty) {
-      throw 'I couldn\'t find any information about "${category.name}" in your library. \n\nPlease add some PDFs or documents to this subject first using the "Add" button at the top right!';
+      throw 'I couldn\'t find any information about "${category.name}" in your library.';
     }
 
-    String prompt = "";
+    // NOTE: Quiz and flashcards prompts target the create_quiz / create_flashcards
+    // TOOLS — structure is enforced by the schema, so this prompt focuses on
+    // CONTENT guidance only. Do not re-add JSON-formatting rules here; they
+    // conflict with "call this function" and degrade tool-call compliance.
     if (type == 'quiz') {
-      prompt = """Using the following context, generate a $count-question multiple choice quiz.
+      return """Create a $count-question multiple-choice quiz for a student studying using the source material below.
 
 Difficulty: ${difficulty.label}.
 ${difficulty.promptGuidance}
 
-Each question must have exactly 4 options. Vary which option is correct (don't always make it the first one). Each question should focus on a different idea — avoid repeating the same concept across questions.
+Content rules for each question:
+- Test understanding of a distinct concept (do not repeat ideas across questions).
+- Provide exactly 4 short, plain-English options — one sentence max.
+- Options must NEVER be raw citations, bibliography entries, author lists, DOIs, URLs, or page-range markers from the source.
+- Vary which option is correct across questions (do not always pick index 0).
+- Provide a one-sentence explanation for the correct answer.
 
-Return ONLY a JSON object with a 'questions' key containing exactly $count questions in the list.
+Call the create_quiz tool with the questions.
 
-Example format:
-{
-  "questions": [
-    {
-      "question": "...",
-      "options": ["...", "...", "...", "..."],
-      "correct_answer": "...",
-      "explanation": "...",
-      "source_quote": "...",
-      "page_number": 1
-    }
-  ]
-}
-
-Context: $context""";
+Source material:
+$context""";
     } else if (type == 'mind_map') {
-      prompt = """Using the following context, extract the key concepts and their relationships to create a Mind Map.
-      Return ONLY a JSON object with:
-      - 'nodes': a list of {id, label}
-      - 'edges': a list of {from, to, label}
-
-      Context: $context""";
-    } else if (type == 'summary') {
-      prompt = "Using the following context, generate a comprehensive study summary. Return ONLY the text. Context: $context";
-    } else if (type == 'flashcards') {
-      prompt = """Using the following context, generate exactly $count flashcards (Question/Answer pairs). Each card should target a different idea — do not duplicate concepts across cards.
-
-Return ONLY a JSON object with a 'cards' key containing exactly $count flashcards in the list.
-
-Example:
-{
-  "cards": [
-    {"question": "...", "answer": "..."}
-  ]
-}
-
+      return """Using the following context, extract key concepts for a Mind Map.
+Return ONLY JSON with 'nodes' and 'edges'.
 Context: $context""";
-    }
-
-    // Larger requests need more tokens to fit the full JSON payload.
-    final int maxTokens = count >= 15 ? 4096 : 2560;
-    // Use near-maximum stability (0.1 is safer for LiteRT than 0.0)
-    final model = await FlutterGemma.getActiveModel(maxTokens: maxTokens);
-    final chat = await model.createChat(temperature: 0.1);
-    await chat.addQuery(Message.text(text: prompt));
-    final response = await chat.generateChatResponse();
-    
-    String rawText = "";
-    if (response is TextResponse) rawText = response.token;
-
-    // The Universal Gemma Response Handler logic
-    final cleanedResponse = _universalGemmaRepair(rawText, type);
-
-    // If the repair still produced empty/invalid data, show the raw refusal
-    if (cleanedResponse.length < 10 && !rawText.contains('{') && type != 'summary') {
-       throw 'Gemma Refusal: "$rawText"';
-    }
-
-    // Auto-title so the materials list shows something useful at a glance.
-    String? autoTitle;
-    if (type == 'quiz') {
-      autoTitle = '${category.name} · ${difficulty.label} · $count Q';
+    } else if (type == 'summary') {
+      return "Using the following context, generate a comprehensive study summary. Context: $context";
     } else if (type == 'flashcards') {
-      autoTitle = '${category.name} · $count cards';
+      return """Create $count flashcards from the source material below — each one a question-and-answer pair covering a distinct concept.
+
+Content rules:
+- Questions should be short and test one concept each.
+- Answers should be 1-2 sentences max.
+- Never include citations, bibliography text, page numbers, or raw quotes as questions or answers.
+
+Call the create_flashcards tool with the cards.
+
+Source material:
+$context""";
+    }
+    return "";
+  }
+
+  Future<GeneratedStudyMaterial> saveMaterial({
+    required SubjectCategory category,
+    required String type,
+    required String content,
+    String? title,
+  }) async {
+    var repaired = _universalGemmaRepair(content, type);
+    // For structured types, parse + validate. Drop garbage questions/cards
+    // and re-encode. Throws on unfixable JSON so we never store a corpse
+    // that surfaces as "Content Error" in the UI later.
+    if (type == 'quiz') {
+      repaired = _validateAndCleanQuiz(repaired);
+    } else if (type == 'flashcards') {
+      repaired = _validateAndCleanFlashcards(repaired);
     }
 
     final material = GeneratedStudyMaterial(
       type: type,
-      title: autoTitle,
-      contentJson: cleanedResponse,
+      title: title,
+      contentJson: repaired,
       dateCreated: DateTime.now(),
     );
     material.category.target = category;
-
     _materialBox.put(material);
     return material;
   }
 
-  /// The Universal Gemma Response Handler.
-  /// Standardizes extraction and repair for ALL Gemma responses.
+  Future<GeneratedStudyMaterial> generateAndSaveMaterial({
+    required SubjectCategory category,
+    required String type,
+    int count = 10,
+    QuizDifficulty difficulty = QuizDifficulty.medium,
+  }) async {
+    await _ensureModelActive();
+    final prompt = await buildPrompt(category: category, type: type, count: count, difficulty: difficulty);
+    final isolatedPrompt = "IMPORTANT: Focus ONLY on this new request. Ignore any previous context.\n\n$prompt";
+
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
+    final chat = await model.createChat(temperature: 0.1);
+    String rawText = "";
+    try {
+      await chat.addQuery(Message.text(text: isolatedPrompt));
+      final response = await chat.generateChatResponse();
+      if (response is TextResponse) rawText = response.token;
+    } finally {
+      // Close the CHAT to release KV cache. Do NOT close the model — it's a
+      // process-wide singleton, and closing it leaves `getActiveModel()`
+      // handing back a dangling pointer that the next inference will
+      // double-free (crash: "pointer being freed was not allocated").
+      await chat.close();
+    }
+
+    String? autoTitle;
+    if (type == 'quiz') autoTitle = '${category.name} · ${difficulty.label} · $count Q';
+    else if (type == 'flashcards') autoTitle = '${category.name} · $count cards';
+
+    return saveMaterial(category: category, type: type, content: rawText, title: autoTitle);
+  }
+
+  /// Universal repair pipeline for model JSON output. Tries hard to coerce
+  /// the on-device model's malformed JSON into something `jsonDecode` can
+  /// parse. The downstream validator drops semantically-garbage content.
   String _universalGemmaRepair(String raw, String type) {
     if (type == 'summary') {
       return raw.replaceAll('```markdown', '').replaceAll('```', '').trim();
     }
 
-    // 1. Atomic Extraction (Find first { or [ and last } or ])
-    final start = raw.contains('{') ? raw.indexOf('{') : (raw.contains('[') ? raw.indexOf('[') : -1);
-    var end = raw.contains('}') ? raw.lastIndexOf('}') : (raw.contains(']') ? raw.lastIndexOf(']') : -1);
-    
+    // 1. Atomic extraction — slice from the first `{`/`[` to the last
+    //    `}`/`]` to strip away any prose/markdown the model wrapped around
+    //    the JSON.
+    final startBrace = raw.indexOf('{');
+    final startBracket = raw.indexOf('[');
+    int start;
+    if (startBrace == -1) {
+      start = startBracket;
+    } else if (startBracket == -1) {
+      start = startBrace;
+    } else {
+      start = startBrace < startBracket ? startBrace : startBracket;
+    }
     if (start == -1) return raw.trim();
-    // If we have a start but no end, take everything to the end of the string
-    if (end == -1 || end <= start) end = raw.length - 1;
-    
+    final endBrace = raw.lastIndexOf('}');
+    final endBracket = raw.lastIndexOf(']');
+    int end = endBrace > endBracket ? endBrace : endBracket;
+    if (end <= start) end = raw.length - 1;
     String s = raw.substring(start, end + 1);
 
-    // 2. Multiline & Whitespace Cleanup
-    // Normalize smart quotes and remove actual newlines inside quotes.
-    s = s.replaceAll('“', '"').replaceAll('”', '"').replaceAll('‘', "'").replaceAll('’', "'");
+    // 2. Normalize smart quotes.
+    s = s
+        .replaceAll('“', '"')
+        .replaceAll('”', '"')
+        .replaceAll('‘', "'")
+        .replaceAll('’', "'");
 
-    // Pass 2.1: State-machine inner-quote normalizer.
-    //
-    // The model frequently emits things like:
-    //   "To create a cost-efficient, "highly scalable", and easy-to-maintain..."
-    // where the inner `"highly scalable"` quotes aren't escaped. The old
-    // regex pass had two bugs:
-    //   (a) Its non-greedy `.*?` stopped at the FIRST `"` followed by a
-    //       comma, leaving a stray closing `"` mid-string.
-    //   (b) When the string contained a fragment like `, "highly`, the
-    //       `,\s*"` alternative in the alt-list would re-anchor on the
-    //       inner comma and corrupt the surrounding field's quotes (e.g.
-    //       `"options":` would become `"options':`).
-    // This state-machine pass walks the string once and only treats a
-    // `"` as the end of a string if what follows it actually looks like
-    // a JSON structural separator (`:`, `]`, `}`, or `,` followed by
-    // another value start). Every other `"` inside a string is replaced
-    // with `'` to neutralize it.
-    s = _normalizeInnerQuotes(s);
+    // 3. Strip stray `\"` escapes the model emits OUTSIDE of strings —
+    //    we've seen [\"foo\", \"bar\"] over-escaping in real output.
+    //    Protect `\\` with a sentinel so escaped backslashes aren't lost.
+    const slashSentinel = '';
+    s = s.replaceAll(r'\\', slashSentinel);
+    s = s.replaceAll(r'\"', '"');
+    s = s.replaceAll(slashSentinel, r'\\');
 
+    // ORDER MATTERS for the next several passes — the state-aware ones
+    // need quote symmetry first so they can correctly identify string
+    // boundaries. Regex-based key/quote normalization runs first, THEN
+    // the state-aware escape-strip and missing-brace insertion.
+
+    // 3.1: Fix ASYMMETRIC key quotes — model sometimes opens a key with
+    //      one quote style and closes with the other: 'title": "Foo" or
+    //      "title': "Foo". Rewrite both to "title":.
     s = s.replaceAllMapped(
-      RegExp(r'":\s*"([^"]*)"', dotAll: true),
-      (m) => '": "${m[1]!.replaceAll('\n', ' ').replaceAll('\r', '')}"'
+      RegExp(r'''(['"])([a-zA-Z_][a-zA-Z0-9_]*)['"]\s*:'''),
+      (m) => '"${m[2]}":',
     );
 
-    // 3. Hallucination Cleanup (Stitch or Wrap "unquoted text" following a quote)
-    // Example: "foo", Hallucination -> "foo Hallucination"
-    //
-    // The captured "hallucination" text MUST start with an ASCII letter —
-    // otherwise the regex used to spuriously match the newline+`}` at the
-    // end of a clean value and garble the closing.
-    for (var i = 0; i < 3; i++) {
-      final before = s;
-      s = s.replaceAllMapped(
-        RegExp(r'("\s*:\s*"[^"]*)"\s*,?\s*([A-Za-z][^"{\[]*?)(?=\s*[,}\]])', dotAll: true),
-        (m) => '${m[1]} ${m[2].toString().trim().replaceAll('"', "'")}"'
-      );
-      if (s == before) break;
-    }
+    // 3.2: Convert Python-style single-quoted strings to JSON double-quoted.
+    //      After this every string is `"..."`, so the state machines
+    //      below can track string vs non-string correctly.
+    s = _convertSingleQuotedStrings(s);
 
-    // 4. Array Wrapper (["A", B, C] -> ["A", "B", "C"]).
-    //
-    // String-aware walker. The previous regex-based pass was depth-blind
-    // and would wrap content INSIDE a string (e.g. converting an inner
-    // `, 'highly scalable',` fragment of a sentence into a malformed
-    // `, "'highly scalable'",` "array item"). This walker only quotes
-    // barewords that sit at actual array depth, outside any string.
+    // 3.3: Strip stray `\"`, `\n`, `\t`, `\r`, etc. OUTSIDE of strings —
+    //      these are invalid JSON syntax. We've seen the model write
+    //      `"summary": "x",\n "next":` where `,\n ` is meant as a line
+    //      break but is actually a literal backslash + 'n'.
+    s = _stripStrayEscapesOutsideStrings(s);
+
+    // 3.4: Insert missing `{` between sibling objects inside arrays. The
+    //      model sometimes writes `},\n "title": ...` instead of
+    //      `},\n { "title": ...`, dropping the opening brace of every
+    //      lesson after the first.
+    s = _insertMissingObjectBracesInArrays(s);
+
+    // 4. Inner-quote normalizer — replaces unescaped `"` inside string
+    //    values with `'` so they don't confuse the parser.
+    s = _normalizeInnerQuotes(s);
+
+    // 4.5: Neutralize invalid escape sequences INSIDE strings. The Gemma
+    //      model occasionally emits things like `"answer": "Foo \X bar"`
+    //      where `\X` isn't a recognized JSON escape — that fails parsing
+    //      with "Unrecognized string escape". Replace each invalid `\X`
+    //      with `\\X` so the backslash becomes a properly escaped literal.
+    s = _neutralizeInvalidInStringEscapes(s);
+
+    // 5. Strip newlines inside `"key": "value"` strings.
+    s = s.replaceAllMapped(
+        RegExp(r'":\s*"([^"]*)"', dotAll: true),
+        (m) =>
+            '": "${m[1]!.replaceAll('\n', ' ').replaceAll('\r', '')}"');
+
+    // 6. Quote bareword array items — including the "dropped opening
+    //    quote" case where the model wrote `[36:11809...tasks?", "next"]`
+    //    instead of `["36:11809...tasks?", "next"]`.
     s = _quoteUnquotedArrayItems(s);
 
-    // 5. Cheap Structural Fixes (Trailing commas, unquoted keys etc)
+    // 7. Cheap structural fixes (trailing commas, unquoted keys).
     s = s.replaceAll(RegExp(r',\s*\}'), '}');
     s = s.replaceAll(RegExp(r',\s*\]'), ']');
-    s = s.replaceAllMapped(RegExp(r'([{,]\s*)([a-zA-Z0-9_]+)\s*:'), (m) => '${m[1]}"${m[2]}":');
+    s = s.replaceAllMapped(
+        RegExp(r'([{,]\s*)([a-zA-Z0-9_]+)\s*:'), (m) => '${m[1]}"${m[2]}":');
 
-    // 6. Force Closure (Handle truncation)
-    // We use a stack to ensure we close in the correct reverse order.
-    List<String> stack = [];
+    // 8. Force closure for truncated output — track open `{`/`[` and close
+    //    them in reverse order. Also close a dangling string.
+    final stack = <String>[];
     bool inQuote = false;
     for (int i = 0; i < s.length; i++) {
-      if (s[i] == '"' && (i == 0 || s[i-1] != '\\')) inQuote = !inQuote;
+      if (s[i] == '"' && (i == 0 || s[i - 1] != '\\')) inQuote = !inQuote;
       if (!inQuote) {
         if (s[i] == '{') stack.add('}');
         if (s[i] == '[') stack.add(']');
@@ -295,17 +337,355 @@ Context: $context""";
       s += stack.removeLast();
     }
 
-    s = JsonUtils.cleanJson(s);
-
-    print('██████████ REPAIRED JSON ██████████');
-    print(s);
-    return s;
+    return JsonUtils.cleanJson(s);
   }
-
 
   bool _isJsonWhitespace(int code) =>
       code == 0x20 || code == 0x09 || code == 0x0A || code == 0x0D;
 
+  /// Given a `jsonDecode` error message (which typically contains "at line
+  /// N, character M"), returns ~6 lines of context around the offending
+  /// region. Falls back to the first 400 chars if we can't parse the
+  /// location.
+  String _extractParseErrorSnippet(String json, String errorMessage) {
+    final m = RegExp(r'line (\d+),\s*character (\d+)').firstMatch(errorMessage);
+    final lines = json.split('\n');
+    if (m == null) {
+      final preview =
+          json.length > 400 ? '${json.substring(0, 400)}…' : json;
+      return preview;
+    }
+    final line = int.parse(m.group(1)!);
+    final col = int.parse(m.group(2)!);
+    final start = (line - 3).clamp(1, lines.length);
+    final end = (line + 2).clamp(1, lines.length);
+    final buf = StringBuffer();
+    for (var ln = start; ln <= end; ln++) {
+      final text = lines[ln - 1];
+      buf.writeln('${ln.toString().padLeft(4)} | $text');
+      if (ln == line) {
+        final pointer = ' ' * (col + 6) + '^';
+        buf.writeln(pointer);
+      }
+    }
+    return buf.toString();
+  }
+
+  /// Inside double-quoted strings, replaces any `\X` where X is not a
+  /// recognized JSON escape (`"`, `\`, `/`, `b`, `f`, `n`, `r`, `t`, or
+  /// `uXXXX`) with `\\X` — i.e. escapes the backslash so the result is
+  /// valid JSON that decodes to a literal backslash followed by X. This
+  /// fixes "Unrecognized string escape" from `jsonDecode`.
+  String _neutralizeInvalidInStringEscapes(String s) {
+    final out = StringBuffer();
+    bool inStr = false;
+    int i = 0;
+    final n = s.length;
+    final hexDigit = RegExp(r'^[0-9a-fA-F]{4}$');
+    while (i < n) {
+      final c = s[i];
+      if (inStr) {
+        if (c == '\\' && i + 1 < n) {
+          final next = s[i + 1];
+          if (next == '"' ||
+              next == '\\' ||
+              next == '/' ||
+              next == 'b' ||
+              next == 'f' ||
+              next == 'n' ||
+              next == 'r' ||
+              next == 't') {
+            out.write(c);
+            out.write(next);
+            i += 2;
+            continue;
+          }
+          if (next == 'u' && i + 6 <= n && hexDigit.hasMatch(s.substring(i + 2, i + 6))) {
+            out.write(s.substring(i, i + 6));
+            i += 6;
+            continue;
+          }
+          // Invalid escape — escape the backslash literally so the JSON
+          // parser sees `\\X`, which decodes to `\` + X.
+          out.write(r'\\');
+          out.write(next);
+          i += 2;
+          continue;
+        }
+        if (c == '"') inStr = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '"') inStr = true;
+      out.write(c);
+      i++;
+    }
+    return out.toString();
+  }
+
+  /// Strips stray escape sequences that the model emits OUTSIDE of strings.
+  /// `\"` becomes `"`, `\n`/`\t`/`\r` become spaces, any other `\X`
+  /// becomes `X` (drops the backslash). Inside double-quoted strings these
+  /// escapes are valid JSON and are preserved as-is.
+  String _stripStrayEscapesOutsideStrings(String s) {
+    final out = StringBuffer();
+    bool inStr = false;
+    bool escape = false;
+    int i = 0;
+    final n = s.length;
+    while (i < n) {
+      final c = s[i];
+      if (inStr) {
+        if (escape) {
+          escape = false;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '\\') {
+          escape = true;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '"') inStr = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '"') {
+        inStr = true;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '\\' && i + 1 < n) {
+        final next = s[i + 1];
+        if (next == '"') {
+          out.write('"');
+        } else if (next == 'n' || next == 't' || next == 'r') {
+          out.write(' ');
+        } else if (next == '\\') {
+          // `\\` outside string — drop both (invalid JSON syntax either way).
+          // (We keep zero output; the second `\` would be re-escaped on
+          // the next iter as a fresh stray.)
+        } else {
+          out.write(next);
+        }
+        i += 2;
+        continue;
+      }
+      out.write(c);
+      i++;
+    }
+    return out.toString();
+  }
+
+  /// Inserts a missing `{` when the model writes a `key: value` pair as a
+  /// flat sibling inside an array instead of as a proper object. Common
+  /// failure mode: lessons 2+ in a workshop are emitted as
+  ///     },\n  "title": "Lesson 2", ...
+  /// when the model meant
+  ///     },\n  { "title": "Lesson 2", ... }
+  /// We track the bracket stack and, after a `}` that's a direct child of
+  /// an array, the next non-whitespace `"` (start of a key string) gets a
+  /// `{` inserted in front of it.
+  String _insertMissingObjectBracesInArrays(String s) {
+    final out = StringBuffer();
+    bool inStr = false;
+    bool escape = false;
+    final stack = <String>[]; // '{' or '['
+    bool justClosedObjInArray = false;
+    int i = 0;
+    final n = s.length;
+    while (i < n) {
+      final c = s[i];
+      if (inStr) {
+        if (escape) {
+          escape = false;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '\\') {
+          escape = true;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '"') inStr = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '"') {
+        if (justClosedObjInArray) {
+          out.write('{');
+          stack.add('{');
+          justClosedObjInArray = false;
+        }
+        inStr = true;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '{') {
+        stack.add('{');
+        justClosedObjInArray = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '}') {
+        if (stack.isNotEmpty && stack.last == '{') stack.removeLast();
+        justClosedObjInArray = stack.isNotEmpty && stack.last == '[';
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '[') {
+        stack.add('[');
+        justClosedObjInArray = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == ']') {
+        if (stack.isNotEmpty && stack.last == '[') stack.removeLast();
+        justClosedObjInArray = false;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == ',') {
+        // Comma after `}` in an array — preserve flag, expect either `{`
+        // (correct) or `"key":` (wrong, we'll insert).
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (_isJsonWhitespace(c.codeUnitAt(0))) {
+        out.write(c);
+        i++;
+        continue;
+      }
+      // Any other non-whitespace, non-string char resets the flag.
+      justClosedObjInArray = false;
+      out.write(c);
+      i++;
+    }
+    return out.toString();
+  }
+
+  /// Rewrites Python-style single-quoted strings (`'foo'`) as JSON
+  /// double-quoted strings (`"foo"`). Walks the input with a small state
+  /// machine so apostrophes INSIDE legitimate double-quoted JSON strings
+  /// (e.g. `"It's a test"`) are left alone.
+  ///
+  /// Handles `\'` as a literal apostrophe inside a single-quoted span, and
+  /// escapes any unescaped `"` inside as `\"` in the output.
+  String _convertSingleQuotedStrings(String s) {
+    final out = StringBuffer();
+    bool inDouble = false;
+    bool dEscape = false;
+    int i = 0;
+    final n = s.length;
+    while (i < n) {
+      final c = s[i];
+      if (inDouble) {
+        if (dEscape) {
+          dEscape = false;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '\\') {
+          dEscape = true;
+          out.write(c);
+          i++;
+          continue;
+        }
+        if (c == '"') {
+          inDouble = false;
+        }
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == '"') {
+        inDouble = true;
+        out.write(c);
+        i++;
+        continue;
+      }
+      if (c == "'") {
+        // Scan for matching closing `'`, honoring `\'` escapes.
+        int j = i + 1;
+        bool localEscape = false;
+        while (j < n) {
+          final cj = s[j];
+          if (localEscape) {
+            localEscape = false;
+            j++;
+            continue;
+          }
+          if (cj == '\\') {
+            localEscape = true;
+            j++;
+            continue;
+          }
+          if (cj == "'") break;
+          j++;
+        }
+        if (j >= n) {
+          // Unterminated — leave the apostrophe alone, don't corrupt.
+          out.write(c);
+          i++;
+          continue;
+        }
+        final inner = s.substring(i + 1, j);
+        out.write('"');
+        bool e2 = false;
+        for (int k = 0; k < inner.length; k++) {
+          final ck = inner[k];
+          if (e2) {
+            if (ck == "'") {
+              // `\'` → literal apostrophe in the new double-quoted string.
+              out.write("'");
+            } else {
+              out.write('\\');
+              out.write(ck);
+            }
+            e2 = false;
+            continue;
+          }
+          if (ck == '\\') {
+            e2 = true;
+            continue;
+          }
+          if (ck == '"') {
+            // Inner double-quote must be escaped.
+            out.write(r'\"');
+            continue;
+          }
+          out.write(ck);
+        }
+        if (e2) out.write('\\');
+        out.write('"');
+        i = j + 1;
+        continue;
+      }
+      out.write(c);
+      i++;
+    }
+    return out.toString();
+  }
+
+  /// State-machine inner-quote normalizer. Treats a `"` as a closing quote
+  /// only if it's followed by a JSON structural separator (`:`, `]`, `}`,
+  /// or `,` then another value start). Every other in-string `"` becomes
+  /// `'` so the parser doesn't see a phantom break.
   String _normalizeInnerQuotes(String s) {
     final out = StringBuffer();
     bool inStr = false;
@@ -383,6 +763,66 @@ Context: $context""";
     return out.toString();
   }
 
+  /// Detects "dropped opening quote" — model wrote `[bareword text", "next"]`
+  /// instead of `["bareword text", "next"]`. Returns the position of the
+  /// closing `"` if the pattern is present, else null. Distinguishes from
+  /// true unquoted barewords via prose markers (` `, `:`, `?`, `!` etc.).
+  int? _findDroppedOpeningClose(String s, int start) {
+    final n = s.length;
+    int j = start;
+    int localDepth = 0;
+    bool sawProseMarker = false;
+    while (j < n) {
+      final c = s[j];
+      if (c == '\\' && j + 1 < n) {
+        j += 2;
+        continue;
+      }
+      if (c == '"') {
+        if (localDepth == 0) {
+          int k = j + 1;
+          while (k < n && _isJsonWhitespace(s.codeUnitAt(k))) {
+            k++;
+          }
+          final atStructural =
+              k >= n || s[k] == ',' || s[k] == ']' || s[k] == '}';
+          if (atStructural && sawProseMarker) return j;
+          if (atStructural && !sawProseMarker) return null;
+        }
+        j++;
+        continue;
+      }
+      if (c == '[' || c == '{') {
+        localDepth++;
+        j++;
+        continue;
+      }
+      if (c == ']' || c == '}') {
+        if (localDepth == 0) return null;
+        localDepth--;
+        j++;
+        continue;
+      }
+      if (c == ',' && localDepth == 0 && !sawProseMarker) {
+        return null;
+      }
+      if (c == ' ' ||
+          c == ':' ||
+          c == '?' ||
+          c == '!' ||
+          c == '(' ||
+          c == ')' ||
+          c == ';') {
+        sawProseMarker = true;
+      }
+      j++;
+    }
+    return null;
+  }
+
+  /// String-aware walker that wraps unquoted array items, including the
+  /// dropped-opening-quote case. Only touches barewords at actual array
+  /// depth (outside any string).
   String _quoteUnquotedArrayItems(String s) {
     final out = StringBuffer();
     bool inStr = false;
@@ -448,6 +888,22 @@ Context: $context""";
         continue;
       }
       if (expectingValue && arrayDepth > 0) {
+        // Check dropped-opening BEFORE the number/literal short-circuit —
+        // pasted citations often start with digits (e.g. `[36:11809-...`).
+        final dropClose = _findDroppedOpeningClose(s, i);
+        if (dropClose != null) {
+          final inner = s.substring(i, dropClose);
+          out.write('"');
+          out.write(inner
+              .replaceAll('\\', r'\\')
+              .replaceAll('"', "'")
+              .replaceAll('\n', ' ')
+              .replaceAll('\r', ' '));
+          out.write('"');
+          i = dropClose + 1;
+          expectingValue = false;
+          continue;
+        }
         final code = c.codeUnitAt(0);
         final isDigit = code >= 0x30 && code <= 0x39;
         if (c == '-' || c == 't' || c == 'f' || c == 'n' || isDigit) {
@@ -456,6 +912,7 @@ Context: $context""";
           i++;
           continue;
         }
+        // True bareword (no prose markers). Wrap as a string.
         int j = i;
         bool localInStr = false;
         while (j < n) {
@@ -486,7 +943,9 @@ Context: $context""";
         final rawVal = span.substring(0, trimEnd);
         final trailing = span.substring(trimEnd);
         final isNumeric = RegExp(r'^-?\d+(\.\d+)?$').hasMatch(rawVal);
-        if (isNumeric || rawVal == 'true' || rawVal == 'false' ||
+        if (isNumeric ||
+            rawVal == 'true' ||
+            rawVal == 'false' ||
             rawVal == 'null') {
           out.write(rawVal);
         } else {
@@ -506,154 +965,294 @@ Context: $context""";
     return out.toString();
   }
 
+  /// Conservative citation detector. Only flags VERY clear copy-paste of
+  /// bibliography/reference text — never legitimate technical answers.
+  /// We've over-rejected before (legitimate Bayesian-stats answers with
+  /// math notation looked citation-shaped), so the thresholds are loose.
+  bool _looksLikeCitation(String text) {
+    final t = text.trim();
+    if (t.isEmpty) return true;
+    // Length cap — generous so verbose technical answers survive.
+    if (t.length > 500) return true;
+    // Page-range patterns specifically (e.g. "12:345-678" or "12:11809-11822").
+    if (RegExp(r'\d+:\d+\d{2,}[-–]\d+').hasMatch(t)) return true;
+    // Long author chains: 4+ consecutive "X.," initials.
+    if (RegExp(r'(?:[A-Z]\.[A-Z]?\.?,\s*){4,}').hasMatch(t)) return true;
+    // DOI / arxiv / isbn explicit prefix.
+    if (RegExp(r'\b(?:doi:|arxiv:|isbn:)', caseSensitive: false).hasMatch(t)) {
+      return true;
+    }
+    // Run-together prose with no spaces at all — rare in real answers.
+    if (t.length > 120 && !t.contains(' ')) return true;
+    return false;
+  }
+
+  /// Accepts the several correct-answer field naming conventions the model
+  /// swings between: `correct_answer`, `answer` (string match), `answerIndex`
+  /// / `correct_index` / `correctIndex` (int into options), and single-letter
+  /// "A"/"B"/"C"/"D". Returns the matching option string, or null.
+  String? _resolveCorrectAnswer(Map q, List<String> options) {
+    final ca = q['correct_answer'];
+    if (ca is String && ca.trim().isNotEmpty) {
+      final t = ca.trim();
+      for (final o in options) {
+        if (o == t) return o;
+      }
+      if (t.length == 1) {
+        final idx = t.toUpperCase().codeUnitAt(0) - 0x41;
+        if (idx >= 0 && idx < options.length) return options[idx];
+      }
+    }
+    final ans = q['answer'];
+    if (ans is String && ans.trim().isNotEmpty) {
+      final t = ans.trim();
+      for (final o in options) {
+        if (o == t) return o;
+      }
+    }
+    final idxField =
+        q['answerIndex'] ?? q['correct_index'] ?? q['correctIndex'];
+    // Accept any numeric type (Gemma's tool calling sometimes emits 0.0
+    // even when the schema declares integer) and clamp to a valid index.
+    if (idxField is num) {
+      final idx = idxField.toInt();
+      if (idx >= 0 && idx < options.length) return options[idx];
+    }
+    if (idxField is String) {
+      final parsed = int.tryParse(idxField.trim()) ??
+          double.tryParse(idxField.trim())?.toInt();
+      if (parsed != null && parsed >= 0 && parsed < options.length) {
+        return options[parsed];
+      }
+    }
+    return null;
+  }
+
+  /// Decodes repaired quiz JSON, drops malformed/citation-laden questions,
+  /// preserves `answerIndex` for the UI (which expects it), and re-encodes.
+  /// THROWS instead of returning broken JSON — we never store a corpse.
+  String _validateAndCleanQuiz(String repaired) {
+    Map<String, dynamic> decoded;
+    try {
+      decoded = jsonDecode(repaired) as Map<String, dynamic>;
+    } catch (e) {
+      final snippet = _extractParseErrorSnippet(repaired, e.toString());
+      debugPrint('██████████ JSON REPAIR FAILED ██████████');
+      debugPrint('After repair:\n$repaired');
+      debugPrint('Parser: $e');
+      throw 'The model produced malformed JSON we could not repair. '
+          'Please try again.\n\nParser: $e\n\nOffending region:\n$snippet';
+    }
+    final raw = (decoded['questions'] as List? ?? []);
+    final good = <Map<String, dynamic>>[];
+    // Track WHY each question got dropped so the error / logs are useful.
+    final rejectionCounts = <String, int>{};
+    final rejectionSamples = <String, String>{};
+    void reject(String reason, Object? sample) {
+      rejectionCounts[reason] = (rejectionCounts[reason] ?? 0) + 1;
+      rejectionSamples[reason] ??=
+          sample?.toString().substring(0, sample.toString().length.clamp(0, 200)) ?? '';
+    }
+
+    for (final q in raw) {
+      if (q is! Map) {
+        reject('not-a-map', q);
+        continue;
+      }
+      final question = q['question'];
+      final options = q['options'];
+      if (question is! String || question.trim().isEmpty) {
+        reject('empty-question', q);
+        continue;
+      }
+      if (options is! List || options.length < 2) {
+        reject('options-not-list-or-too-few', options);
+        continue;
+      }
+      final stringOpts =
+          options.map((e) => e?.toString() ?? '').toList(growable: false);
+      if (stringOpts.any((o) => o.trim().isEmpty)) {
+        reject('empty-option', stringOpts);
+        continue;
+      }
+      final citationIdx = stringOpts.indexWhere(_looksLikeCitation);
+      if (citationIdx >= 0) {
+        reject('citation-shaped-option', stringOpts[citationIdx]);
+        continue;
+      }
+      final correct = _resolveCorrectAnswer(q, stringOpts);
+      if (correct == null) {
+        reject('no-resolvable-correct-answer', q);
+        continue;
+      }
+      final answerIndex = stringOpts.indexOf(correct);
+      good.add({
+        'question': question.trim(),
+        'options': stringOpts,
+        'answerIndex': answerIndex,
+        'correct_answer': correct,
+        if (q['explanation'] is String) 'explanation': q['explanation'],
+      });
+    }
+
+    if (good.isEmpty) {
+      // Dump diagnostic info to the console for the developer, AND build a
+      // user-facing breakdown so the snackbar Details dialog explains what
+      // happened instead of giving a vague "no usable questions" string.
+      debugPrint('██████████ QUIZ VALIDATION DROPPED ALL ${raw.length} QUESTIONS ██████████');
+      rejectionCounts.forEach((reason, count) {
+        debugPrint('  $count × $reason  e.g. "${rejectionSamples[reason]}"');
+      });
+      final breakdown = rejectionCounts.entries
+          .map((e) =>
+              '  • ${e.value} × ${e.key}\n    e.g. "${rejectionSamples[e.key]}"')
+          .join('\n');
+      throw 'All ${raw.length} questions from the model were rejected by '
+          'validation. Please try again — lowering the question count or '
+          'difficulty often helps.\n\nBreakdown:\n$breakdown';
+    }
+    return jsonEncode({'questions': good});
+  }
+
+  String _validateAndCleanFlashcards(String repaired) {
+    Map<String, dynamic> decoded;
+    try {
+      decoded = jsonDecode(repaired) as Map<String, dynamic>;
+    } catch (e) {
+      final snippet = _extractParseErrorSnippet(repaired, e.toString());
+      debugPrint('██████████ JSON REPAIR FAILED ██████████');
+      debugPrint('After repair:\n$repaired');
+      debugPrint('Parser: $e');
+      throw 'The model produced malformed JSON we could not repair. '
+          'Please try again.\n\nParser: $e\n\nOffending region:\n$snippet';
+    }
+    final raw = (decoded['cards'] as List? ?? []);
+    final good = <Map<String, dynamic>>[];
+    for (final c in raw) {
+      if (c is! Map) continue;
+      final q = c['question'];
+      final a = c['answer'];
+      if (q is! String || q.trim().isEmpty) continue;
+      if (a is! String || a.trim().isEmpty) continue;
+      if (_looksLikeCitation(q) || _looksLikeCitation(a)) continue;
+      good.add({'question': q.trim(), 'answer': a.trim()});
+    }
+    if (good.isEmpty) {
+      throw 'The model produced no usable flashcards. Please try again.';
+    }
+    return jsonEncode({'cards': good});
+  }
 
   List<GeneratedStudyMaterial> getMaterialsForCategory(int categoryId) {
     return _materialBox.query(GeneratedStudyMaterial_.category.equals(categoryId)).build().find();
   }
 
-  // =====================================================================
-  // Workshop generation, progress tracking, and badge awards.
-  //
-  // Workshops are stored as a `GeneratedStudyMaterial` with type='workshop'.
-  // The `contentJson` is mutated in-place as the user progresses, so we get
-  // persistence "for free" via the existing ObjectBox material box.
-  // Lesson bodies are generated lazily on first open to keep the initial
-  // workshop generation snappy.
-  // =====================================================================
+  /// Calculates the progress percentage (0..1) for a workshop material.
+  double workshopProgress(GeneratedStudyMaterial material) {
+    if (material.type != 'workshop') return 0.0;
+    try {
+      final data = jsonDecode(JsonUtils.extractAndCleanJson(material.contentJson)) as Map<String, dynamic>;
+      final lessons = (data['lessons'] as List? ?? []);
+      if (lessons.isEmpty) return 0.0;
 
-  /// Stage labels emitted during workshop generation.
-  static const stageOutline = 'Drafting workshop outline...';
-  static const stageDone = 'Workshop ready';
+      final completedCount = lessons.where((l) => (l as Map)['completed'] == true).length;
+      return completedCount / lessons.length;
+    } catch (e) {
+      return 0.0;
+    }
+  }
 
-  /// Generates the *outline* of a workshop (title, description, lesson
-  /// titles + key points). Lesson bodies are NOT generated here — they're
-  /// filled in lazily by [generateLessonBody] when the user opens a
-  /// lesson for the first time.
-  ///
-  /// [onProgress] is called with a stage label and a 0..1 progress value.
   Future<GeneratedStudyMaterial> generateWorkshopMaterial({
     required SubjectCategory category,
     int lessonCount = 6,
     WorkshopDepth depth = WorkshopDepth.intermediate,
     void Function(String stage, double progress)? onProgress,
   }) async {
-    onProgress?.call(stageOutline, 0.0);
+    onProgress?.call('Drafting workshop outline...', 0.0);
     await _ensureModelActive();
 
-    // Pull a generous amount of context so the outline reflects the full
-    // breadth of the subject.
     final chunks = await _ragService.searchByCategory(
       'Comprehensive overview of ${category.name} for a structured course',
       category.id,
-      maxResults: 5,
+      maxResults: MemoryGuard.instance.ragChunksForLookup,
     );
-    final context = chunks.map((c) => c.text).join('\n\n');
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join('\n\n'));
 
+    // Plain English instruction. The schema is enforced by the
+    // create_workshop_outline TOOL — the model literally cannot emit
+    // invalid structure because the runtime constrains generation at the
+    // token level. No JSON repair pipeline, no FormatException.
     final prompt = '''You are designing a structured workshop for a student studying "${category.name}".
-
 Difficulty: ${depth.label}.
 ${depth.promptGuidance}
 
-Build a course outline of EXACTLY $lessonCount lessons that progresses logically from foundations to more advanced material. Use the supplied context as the source of truth — don't invent topics that aren't supported by the context.
+Build a course outline of EXACTLY $lessonCount lessons that progresses logically from foundations to advanced. Use the supplied context as the source of truth — do not invent topics that aren't supported by the context.
 
-CRITICAL JSON RULES — read these carefully:
-1. Output ONLY a single JSON object. No prose before or after, no markdown code fences.
-2. The entire output must be one continuous JSON object. DO NOT split long descriptions into multiple strings.
-3. EVERY string value must be wrapped in double quotes ("), even if the value contains commas, colons, or other punctuation.
-4. Inside any string, escape inner double quotes as \".
-5. Do NOT put trailing commas before } or ].
-6. Numbers (like estimatedMinutes) must NOT be quoted.
+Call the create_workshop_outline tool with the outline. Every lesson needs a title, a short summary, 2-4 keyPoints, and an estimatedMinutes integer.
 
-{
-  "title": "Workshop Title",
-  "description": "Short summary",
-  "lessons": [
-    {
-      "title": "Lesson 1",
-      "summary": "Short overview",
-      "keyPoints": ["Point A", "Point B"],
-      "estimatedMinutes": 10
-    }
-  ]
-}
-
-The lessons array MUST contain exactly $lessonCount entries.
 Context:
 $context''';
 
-    print('██████████ MODEL GENERATION STARTED (Prompt length: ${prompt.length}) ██████████');
-    final model = await FlutterGemma.getActiveModel(maxTokens: 2048);
-    // Lower temperature for stricter, more deterministic structured output.
-    final chat = await model.createChat(temperature: 0.1);
-    await chat.addQuery(Message.text(text: prompt));
-    final response = await chat.generateChatResponse();
-
-    onProgress?.call(stageOutline, 0.85);
-
-    String raw = '';
-    if (response is TextResponse) raw = response.token;
-
-    Map<String, dynamic> outline;
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
+    final chat = await model.createChat(
+      temperature: 0.1,
+      supportsFunctionCalls: true,
+      tools: const [EducationalToolService.workshopOutlineTool],
+      toolChoice: ToolChoice.required,
+    );
+    Map<String, dynamic>? outline;
     try {
-      final repaired = _universalGemmaRepair(raw, 'workshop');
-      outline = jsonDecode(repaired) as Map<String, dynamic>;
-    } catch (e) {
-      onProgress?.call('Repairing JSON...', 0.92);
-      // _decodeOutline already tried both the as-is and aggressive repair
-      // passes. If we land here, surface a clean error with a snippet so
-      // the user can retry (and so it's debuggable).
-      final preview = raw.length > 600 ? '${raw.substring(0, 600)}...' : raw;
-      throw StateError(
-        'Workshop outline JSON could not be parsed even after local repair.\n'
-        'Parser error: $e\n'
-        'Tip: try generating again — the on-device model occasionally emits '
-        'malformed JSON. Lowering depth or lesson count can also help.\n'
-        'Raw output preview:\n$preview',
-      );
+      await chat.addQuery(Message.text(text: prompt));
+      final response = await chat.generateChatResponse();
+      if (response is FunctionCallResponse &&
+          response.name == 'create_workshop_outline') {
+        outline = Map<String, dynamic>.from(response.args);
+      } else if (response is ParallelFunctionCallResponse) {
+        for (final call in response.calls) {
+          if (call.name == 'create_workshop_outline') {
+            outline = Map<String, dynamic>.from(call.args);
+            break;
+          }
+        }
+      }
+    } finally {
+      await chat.close();
     }
 
-    // Normalize lesson list and inject empty body fields (lazy fill).
+    if (outline == null) {
+      throw 'The model did not produce a workshop outline. Please try again.';
+    }
+
     final rawLessons = (outline['lessons'] as List? ?? []);
     final lessons = <Map<String, dynamic>>[];
     for (var i = 0; i < rawLessons.length; i++) {
       final l = Map<String, dynamic>.from(rawLessons[i] as Map);
       l['index'] = i;
-      l['body'] ??= ''; // generated on demand
+      l['body'] ??= '';
       l['completed'] ??= false;
       l['completedAt'] ??= null;
-      l['keyPoints'] ??= <dynamic>[];
-      l['estimatedMinutes'] ??= 8;
       lessons.add(l);
     }
 
-    final workshopJson = <String, dynamic>{
+    final workshopJson = {
       'title': outline['title'] ?? '${category.name} Workshop',
-      'description':
-          outline['description'] ?? 'A structured course on ${category.name}.',
+      'description': outline['description'] ?? 'A structured course.',
       'depth': depth.label,
       'lessonCount': lessons.length,
       'lessons': lessons,
-      'startedAt': null,
-      'lastAccessedAt': null,
-      'lastLessonIndex': 0,
       'awardedBadges': <String>[],
     };
 
-    final material = GeneratedStudyMaterial(
+    return saveMaterial(
+      category: category,
       type: 'workshop',
+      content: jsonEncode(workshopJson),
       title: '${category.name} · ${depth.label} workshop',
-      contentJson: jsonEncode(workshopJson),
-      dateCreated: DateTime.now(),
     );
-    material.category.target = category;
-    _materialBox.put(material);
-
-    onProgress?.call(stageDone, 1.0);
-    return material;
   }
 
-  /// Lazily generates the body of a single lesson as a stream of updates.
-  /// Stores the final body back into the workshop's contentJson.
   Stream<Map<String, dynamic>> generateLessonBodyStream({
     required GeneratedStudyMaterial workshop,
     required int lessonIndex,
@@ -667,6 +1266,9 @@ $context''';
 
     await _ensureModelActive();
 
+    // Build a COMPACT outline (titles only) instead of dumping the entire
+    // workshop JSON — that easily blows past the 2048-token input budget
+    // for any workshop with more than a few lessons / non-empty bodies.
     final categoryName = workshop.category.target?.name ?? 'the topic';
     final depthLabel = data['depth'] as String? ?? 'Intermediate';
     final outlineSummary = lessons.asMap().entries.map((e) {
@@ -674,236 +1276,168 @@ $context''';
       return '${e.key + 1}. $title';
     }).join('\n');
 
+    // Pull RAG chunks targeted at THIS lesson — much more useful than
+    // re-using the whole workshop blob.
+    final keyPoints =
+        (lesson['keyPoints'] as List? ?? const []).join(' ');
+    final query =
+        '${lesson['title']} ${lesson['summary'] ?? ''} $keyPoints'.trim();
     final chunks = await _ragService.searchByCategory(
-      '${lesson['title']} ${(lesson['summary'] ?? '')}',
+      query,
       workshop.category.target?.id ?? 0,
-      maxResults: 5,
+      maxResults: MemoryGuard.instance.ragChunksForLookup,
     );
-    final context = chunks.map((c) => c.text).join('\n\n');
+    final context = MemoryGuard.instance
+        .capContext(chunks.map((c) => c.text).join('\n\n'));
 
     final prompt = '''You are writing one lesson in a structured workshop on "$categoryName" (overall difficulty: $depthLabel).
 
 Course outline:
 $outlineSummary
 
-Now write the BODY for this specific lesson:
+Now write the BODY for this specific lesson.
 Title: ${lesson['title']}
 Summary: ${lesson['summary'] ?? ''}
 Key points the lesson must cover:
-${(lesson['keyPoints'] as List? ?? []).map((kp) => '- $kp').join('\n')}
+${(lesson['keyPoints'] as List? ?? const []).map((kp) => '- $kp').join('\n')}
 
 Write a clear, ${depthLabel.toLowerCase()}-level lesson in Markdown. Use:
 - A short opening paragraph that motivates the topic.
 - Section headings (## Subtopic) where useful.
 - Bullet lists for enumerations.
 - Code blocks (```) for any code snippets.
-- A short "Recap" section at the end that lists 2-3 takeaways.
+- A short "Recap" section at the end with 2-3 takeaways.
 
-DO NOT repeat the lesson title at the top — start straight into the content. Use the supplied context as the source of truth and stay grounded in it.
+DO NOT repeat the lesson title at the top — start straight into the content. Stay grounded in the supplied context.
 
 Context:
 $context''';
 
-    print('██████████ STREAMING LESSON BODY (Prompt: ${prompt.length}) ██████████');
-    final model = await FlutterGemma.getActiveModel(maxTokens: 2048);
-    // 0.1 is the sweet spot for structured data stability on mobile
+    // 4096 tokens of headroom — prompt is now small, response can be long.
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
     final chat = await model.createChat(temperature: 0.1);
-    await chat.addQuery(Message.text(text: prompt));
-
-    final stream = chat.generateChatResponseAsync();
     String fullBody = '';
-
-    await for (final response in stream) {
-      if (response is TextResponse) {
-        fullBody += response.token;
-        lesson['body'] = fullBody.replaceAll('```markdown', '```').trim();
-        yield lesson;
+    try {
+      await chat.addQuery(Message.text(text: prompt));
+      await for (final resp in chat.generateChatResponseAsync()) {
+        if (resp is TextResponse) {
+          fullBody += resp.token;
+          lesson['body'] = fullBody.replaceAll('```markdown', '```').trim();
+          yield lesson;
+        }
       }
+    } finally {
+      await chat.close();
     }
-
-    // Final persist
     data['lessons'] = lessons;
     workshop.contentJson = jsonEncode(data);
     _materialBox.put(workshop);
   }
 
-  /// Generates a quiz specifically for a single lesson's content.
   Future<GeneratedStudyMaterial> generateLessonQuiz({
     required SubjectCategory category,
     required String lessonTitle,
     required String lessonBody,
   }) async {
     await _ensureModelActive();
+    // Plain-English prompt — structure is enforced by the create_quiz
+    // TOOL, not by prompt wording. The runtime constrains generation at
+    // the token level so the model cannot emit broken JSON.
+    final prompt = '''Create a 5-question multiple-choice quiz based ONLY on this lesson content.
 
-    final prompt = '''You are an expert examiner. Create a 5-question multiple-choice quiz based ONLY on the following lesson content.
+Every question needs exactly 4 short, plain-text options and a correct answerIndex (0..3). Never include citations, bibliography entries, or raw quotes as options.
+
+Call the create_quiz tool with the questions.
 
 Lesson Title: $lessonTitle
 Content:
-$lessonBody
+$lessonBody''';
 
-CRITICAL JSON RULES:
-1. Output ONLY a valid JSON object.
-2. Format:
-{
-  "questions": [
-    {
-      "question": "Question text?",
-      "options": ["A", "B", "C", "D"],
-      "correct_answer": "A",
-      "explanation": "Why A is correct"
-    }
-  ]
-}
-
-Ensure questions are challenging but fair based on the text.''';
-
-    final model = await FlutterGemma.getActiveModel(maxTokens: 2048);
-    final chat = await model.createChat(temperature: 0.1);
-    await chat.addQuery(Message.text(text: prompt));
-    final response = await chat.generateChatResponse();
-
-    String raw = '';
-    if (response is TextResponse) raw = response.token;
-
-    // Use the new universal repair pipeline
-    final repaired = _universalGemmaRepair(raw, 'quiz');
-
-    final material = GeneratedStudyMaterial(
-      type: 'quiz',
-      title: 'Quiz: $lessonTitle',
-      contentJson: repaired,
-      dateCreated: DateTime.now(),
+    final model =
+        await FlutterGemma.getActiveModel(maxTokens: MemoryGuard.instance.maxTokens);
+    final chat = await model.createChat(
+      temperature: 0.1,
+      supportsFunctionCalls: true,
+      tools: const [EducationalToolService.quizTool],
+      toolChoice: ToolChoice.required,
     );
-    material.category.target = category;
-    _materialBox.put(material);
-    return material;
-  }
 
-  /// Records the user opening a lesson — sets `startedAt`/`lastAccessedAt`
-  /// and (idempotently) awards the "Workshop Started" badge if needed.
-  ///
-  /// Returns the list of NEWLY awarded badges (so the UI can show them).
-  List<Badge> noteLessonOpened({
-    required GeneratedStudyMaterial workshop,
-    required int lessonIndex,
-  }) {
-    final data = jsonDecode(JsonUtils.extractAndCleanJson(workshop.contentJson)) as Map<String, dynamic>;
-    final now = DateTime.now().toIso8601String();
-    data['startedAt'] ??= now;
-    data['lastAccessedAt'] = now;
-    data['lastLessonIndex'] = lessonIndex;
-
-    final newBadges = _maybeAwardMilestoneBadges(workshop, data);
-    workshop.contentJson = jsonEncode(data);
-    _materialBox.put(workshop);
-    return newBadges;
-  }
-
-  /// Marks a lesson complete, persists progress, and awards milestone
-  /// badges (25%, 50%, 100%) the first time each threshold is crossed.
-  /// Returns the list of newly awarded badges so the UI can celebrate.
-  List<Badge> markLessonComplete({
-    required GeneratedStudyMaterial workshop,
-    required int lessonIndex,
-  }) {
-    final data = jsonDecode(JsonUtils.extractAndCleanJson(workshop.contentJson)) as Map<String, dynamic>;
-    final lessons = (data['lessons'] as List).cast<Map<String, dynamic>>();
-    if (lessonIndex < 0 || lessonIndex >= lessons.length) return const [];
-
-    final lesson = lessons[lessonIndex];
-    if (lesson['completed'] != true) {
-      lesson['completed'] = true;
-      lesson['completedAt'] = DateTime.now().toIso8601String();
+    String content = '';
+    try {
+      await chat.addQuery(Message.text(text: prompt));
+      final response = await chat.generateChatResponse();
+      Map<String, dynamic>? args;
+      if (response is FunctionCallResponse &&
+          response.name == EducationalToolService.quizTool.name) {
+        args = Map<String, dynamic>.from(response.args);
+      } else if (response is ParallelFunctionCallResponse) {
+        for (final call in response.calls) {
+          if (call.name == EducationalToolService.quizTool.name) {
+            args = Map<String, dynamic>.from(call.args);
+            break;
+          }
+        }
+      }
+      if (args != null) {
+        content = jsonEncode(args);
+      } else if (response is TextResponse && response.token.isNotEmpty) {
+        // Fallback for model variants that ignore ToolChoice.required —
+        // saveMaterial's repair pipeline will sort out the JSON.
+        content = response.token;
+      }
+    } finally {
+      await chat.close();
     }
-    data['lessons'] = lessons;
+
+    if (content.isEmpty) {
+      throw 'The model did not produce a quiz for "$lessonTitle". Please try again.';
+    }
+    return saveMaterial(
+        category: category, type: 'quiz', content: content, title: 'Quiz: $lessonTitle');
+  }
+
+  List<Badge> noteLessonOpened({required GeneratedStudyMaterial workshop, required int lessonIndex}) {
+    final data = jsonDecode(JsonUtils.extractAndCleanJson(workshop.contentJson)) as Map<String, dynamic>;
     data['lastAccessedAt'] = DateTime.now().toIso8601String();
     data['lastLessonIndex'] = lessonIndex;
-
     final newBadges = _maybeAwardMilestoneBadges(workshop, data);
     workshop.contentJson = jsonEncode(data);
     _materialBox.put(workshop);
     return newBadges;
   }
 
-  /// Returns currently-completed percentage 0..1 for a workshop material.
-  double workshopProgress(GeneratedStudyMaterial workshop) {
-    try {
-      final data = jsonDecode(JsonUtils.extractAndCleanJson(workshop.contentJson)) as Map<String, dynamic>;
-      final lessons = (data['lessons'] as List? ?? []);
-      if (lessons.isEmpty) return 0.0;
-      final done = lessons.where((l) => l['completed'] == true).length;
-      return done / lessons.length;
-    } catch (_) {
-      return 0.0;
-    }
+  List<Badge> markLessonComplete({required GeneratedStudyMaterial workshop, required int lessonIndex}) {
+    final data = jsonDecode(JsonUtils.extractAndCleanJson(workshop.contentJson)) as Map<String, dynamic>;
+    final lessons = (data['lessons'] as List);
+    lessons[lessonIndex]['completed'] = true;
+    lessons[lessonIndex]['completedAt'] = DateTime.now().toIso8601String();
+    final newBadges = _maybeAwardMilestoneBadges(workshop, data);
+    workshop.contentJson = jsonEncode(data);
+    _materialBox.put(workshop);
+    return newBadges;
   }
 
-  /// Awards milestone badges that haven't been awarded yet, mutating the
-  /// workshop data in place. Caller is responsible for persisting `data`.
-  List<Badge> _maybeAwardMilestoneBadges(
-    GeneratedStudyMaterial workshop,
-    Map<String, dynamic> data,
-  ) {
-    final lessons = (data['lessons'] as List).cast<Map<String, dynamic>>();
-    final total = lessons.length;
-    if (total == 0) return const [];
-    final done = lessons.where((l) => l['completed'] == true).length;
-    final percent = done / total;
-
-    final awarded =
-        ((data['awardedBadges'] as List?)?.cast<String>() ?? const <String>[])
-            .toSet();
-
-    final categoryName =
-        workshop.category.target?.name ?? 'a workshop';
-    final workshopTitle = data['title'] as String? ?? '$categoryName Workshop';
-
+  List<Badge> _maybeAwardMilestoneBadges(GeneratedStudyMaterial workshop, Map<String, dynamic> data) {
+    final awarded = (data['awardedBadges'] as List? ?? []).cast<String>();
     final newBadges = <Badge>[];
-
-    void award(String key, String name, String reason) {
-      if (awarded.contains(key)) return;
-      final b = Badge(
-        name: name,
-        description: reason,
-        dateEarned: DateTime.now(),
-      );
-      b.category.target = workshop.category.target;
-      _ragService.store.box<Badge>().put(b);
-      awarded.add(key);
-      newBadges.add(b);
+    
+    void addBadge(String name, String desc) {
+      if (!awarded.contains(name)) {
+        final b = Badge(name: name, description: desc, dateEarned: DateTime.now());
+        b.category.target = workshop.category.target;
+        objectBox.store.box<Badge>().put(b);
+        newBadges.add(b);
+        awarded.add(name);
+      }
     }
 
-    // Started: any lesson opened OR completed, OR startedAt set.
-    if (data['startedAt'] != null) {
-      award(
-        'workshop_started',
-        'Workshop Started',
-        'Began the "$workshopTitle".',
-      );
-    }
-    if (percent >= 0.25) {
-      award(
-        'workshop_25',
-        '25% Complete',
-        'Quarter of the way through "$workshopTitle".',
-      );
-    }
-    if (percent >= 0.50) {
-      award(
-        'workshop_50',
-        'Halfway There',
-        'Half of "$workshopTitle" complete.',
-      );
-    }
-    if (percent >= 1.00) {
-      award(
-        'workshop_complete',
-        'Workshop Champion',
-        'Completed every lesson of "$workshopTitle".',
-      );
-    }
+    if (data['startedAt'] != null) addBadge('Scholar', 'Started your first workshop!');
+    final lessons = (data['lessons'] as List);
+    final completed = lessons.where((l) => (l as Map)['completed'] == true).length;
+    if (completed >= lessons.length) addBadge('Graduate', 'Completed all lessons in this workshop!');
 
-    data['awardedBadges'] = awarded.toList();
+    data['awardedBadges'] = awarded;
     return newBadges;
   }
 }

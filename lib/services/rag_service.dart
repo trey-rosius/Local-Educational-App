@@ -197,8 +197,11 @@ class RagService {
     required PlatformFile file,
     required SubjectCategory category,
     Function(int page, int total)? onProgress,
+    Function(int page, int total)? onPageProgress,
+    Function(int chunk, int total)? onChunkProgress,
     Function(int step, int subStep)? onStep,
     int embedBatchSize = 32,
+    int minChunkChars = 20,
   }) async {
     final stopwatch = Stopwatch()..start();
 
@@ -253,6 +256,7 @@ class RagService {
     for (int i = 0; i < pageCount; i++) {
       final int pageNumber = i + 1;
       onProgress?.call(pageNumber, pageCount);
+      onPageProgress?.call(pageNumber, pageCount);
 
       final String pageText =
           extractor.extractText(startPageIndex: i, endPageIndex: i);
@@ -262,10 +266,16 @@ class RagService {
           textSplitter.createDocuments([pageText]);
       for (final d in splitDocs) {
         final t = d.pageContent.trim();
-        if (t.isEmpty) continue;
+        // Drop tiny chunks — they cost just as much to embed but rarely
+        // produce useful semantic matches.
+        if (t.length < minChunkChars) continue;
         pendingTexts.add(t);
         pendingPages.add(pageNumber);
       }
+
+      // Yield once per page so the UI thread can paint progress updates
+      // during the (CPU-bound) text extraction loop.
+      await Future.delayed(Duration.zero);
     }
 
     pdfDoc.dispose();
@@ -283,6 +293,10 @@ class RagService {
     // is dramatically faster than calling generateEmbedding() per chunk.
     final List<VectorChunk> chunksToInsert = [];
     final int total = pendingTexts.length;
+
+    // Surface the total chunk count as soon as we know it so the UI can
+    // render "0 of 412 chunks" immediately instead of "0 of unknown".
+    onChunkProgress?.call(0, total);
 
     for (int start = 0; start < total; start += embedBatchSize) {
       final int end =
@@ -330,6 +344,7 @@ class RagService {
       // Repurpose the page-progress callback so the UI keeps moving while we
       // embed (otherwise it would freeze at 100% during phase B).
       onProgress?.call(end, total);
+      onChunkProgress?.call(end, total);
     }
 
     // Step 6: Single batched vector write

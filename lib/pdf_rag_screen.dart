@@ -11,7 +11,7 @@ import 'models/entities.dart';
 import 'services/rag_service.dart';
 import 'models/embedding_model.dart' as example_embedding_model;
 import 'models/model.dart';
-import 'thinking_widget.dart';
+import 'widgets/glass_thinking_panel.dart';
 import 'services/auth_token_service.dart';
 import 'category_browser_screen.dart';
 import 'chat_message.dart';
@@ -40,6 +40,14 @@ class _PdfRagScreenState extends State<PdfRagScreen> {
   
   List<Message> _messages = [];
   String? _currentStreamingText;
+
+  // Gemma 4 reasoning channel — streams as ThinkingResponse alongside the
+  // answer text. We accumulate it while the model is thinking, then attach
+  // it to the bot's reply once the response message is added to _messages.
+  String? _currentStreamingThinking;
+  // Maps message index in `_messages` → captured thinking content for
+  // that message. Only populated for bot responses that produced any.
+  final Map<int, String> _thinkingByMessageIndex = {};
 
   @override
   void initState() {
@@ -262,6 +270,7 @@ class _PdfRagScreenState extends State<PdfRagScreen> {
       _statusMessage = 'Searching category: ${_subjectController.text}...';
       _messages.add(Message.text(text: query, isUser: true));
       _currentStreamingText = '';
+      _currentStreamingThinking = null;
       _searchController.clear();
     });
 
@@ -289,10 +298,18 @@ class _PdfRagScreenState extends State<PdfRagScreen> {
         final stream = await _ragService!.generateAnswerStream(query, results);
         await for (final response in stream) {
           if (!mounted) break;
-          
+
           if (response is TextResponse) {
             setState(() {
               _currentStreamingText = (_currentStreamingText ?? '') + response.token;
+            });
+            _scrollToBottom();
+          } else if (response is ThinkingResponse) {
+            // Gemma 4 reasoning channel — accumulate so we can display it
+            // in the GlassThinkingPanel above the eventual answer bubble.
+            setState(() {
+              _currentStreamingThinking =
+                  (_currentStreamingThinking ?? '') + response.content;
             });
             _scrollToBottom();
           } else if (response is FunctionCallResponse) {
@@ -305,11 +322,18 @@ class _PdfRagScreenState extends State<PdfRagScreen> {
             _scrollToBottom();
           }
         }
-        
+
         if (_currentStreamingText != null && _currentStreamingText!.isNotEmpty) {
           setState(() {
-             _messages.add(Message.text(text: _currentStreamingText!));
-             _currentStreamingText = null;
+            _messages.add(Message.text(text: _currentStreamingText!));
+            // Attach the captured reasoning (if any) to this new message.
+            final newIndex = _messages.length - 1;
+            final thinking = _currentStreamingThinking;
+            if (thinking != null && thinking.trim().isNotEmpty) {
+              _thinkingByMessageIndex[newIndex] = thinking;
+            }
+            _currentStreamingText = null;
+            _currentStreamingThinking = null;
           });
         }
         debugPrint('Search workflow completed successfully');
@@ -553,14 +577,34 @@ class _PdfRagScreenState extends State<PdfRagScreen> {
                 ],
               ),
               const SizedBox(height: 16),
-              ..._messages.map((m) => ChatMessageWidget(message: m)),
+              // Interleave thinking panels before any bot replies that
+              // captured reasoning, so the user can expand them inline.
+              for (int i = 0; i < _messages.length; i++) ...[
+                if (_thinkingByMessageIndex[i] != null)
+                  GlassThinkingPanel(
+                    content: _thinkingByMessageIndex[i]!,
+                    isStreaming: false,
+                  ),
+                ChatMessageWidget(message: _messages[i]),
+              ],
+              // Live thinking panel while the model is reasoning. Shown
+              // ABOVE any text that's already streaming.
+              if (_isSearching &&
+                  _currentStreamingThinking != null &&
+                  _currentStreamingThinking!.trim().isNotEmpty)
+                GlassThinkingPanel(
+                  content: _currentStreamingThinking!,
+                  isStreaming: true,
+                ),
               if (_currentStreamingText != null &&
                   _currentStreamingText!.isNotEmpty)
                 ChatMessageWidget(
                     message: Message.text(text: _currentStreamingText!)),
               if (_isSearching &&
                   (_currentStreamingText == null ||
-                      _currentStreamingText!.isEmpty))
+                      _currentStreamingText!.isEmpty) &&
+                  (_currentStreamingThinking == null ||
+                      _currentStreamingThinking!.isEmpty))
                 _buildThinkingPill(),
             ],
           ),

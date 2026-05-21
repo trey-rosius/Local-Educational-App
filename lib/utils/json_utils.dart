@@ -29,7 +29,10 @@ class JsonUtils {
     json = json.replaceAll(RegExp(r',\s*]'), ']');
     json = json.replaceAll(RegExp(r',\s*}'), '}');
     
-    // 2. Fix the specific error seen: number followed by extra quote (e.g. : 1")
+    // 2. Fix hallucinated numbers inside objects: {1, "question": ...
+    json = json.replaceAll(RegExp(r'\{\s*\d+\s*,\s*'), '{');
+    
+    // 3. Fix the specific error seen: number followed by extra quote (e.g. : 1")
     json = json.replaceAllMapped(RegExp(r'(:\s*\d+)"(\s*[,}])'), (m) => '${m[1]}${m[2]}');
     
     // 3. Fix unescaped control characters inside strings (like newlines)

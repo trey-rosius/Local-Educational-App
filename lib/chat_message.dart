@@ -1,10 +1,12 @@
 import 'dart:typed_data';
 import 'dart:convert';
+import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter_gemma/flutter_gemma.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'utils/audio_converter.dart';
 import 'widgets/educational_widgets.dart';
+import 'widgets/glass_theme.dart';
 import 'utils/json_utils.dart';
 
 class ChatMessageWidget extends StatelessWidget {
@@ -28,66 +30,112 @@ class ChatMessageWidget extends StatelessWidget {
       return _buildSystemMessage(context);
     }
 
+    final isUser = message.isUser;
+    // Glass-themed bubble — accent-tinted for user, neutral surface for bot.
+    final Color bubbleTint = isUser
+        ? GlassTheme.accentBlue.withOpacity(0.22)
+        : GlassTheme.surface;
+    final Color bubbleBorder = isUser
+        ? GlassTheme.accentBlue.withOpacity(0.55)
+        : GlassTheme.border;
+    final Color codeBg = isUser
+        ? GlassTheme.accentBlue.withOpacity(0.18)
+        : Colors.white.withOpacity(0.10);
+
     return Container(
-      margin: const EdgeInsets.symmetric(vertical: 10.0),
+      margin: const EdgeInsets.symmetric(vertical: 8.0),
       child: Row(
-        mainAxisAlignment: message.isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisAlignment:
+            isUser ? MainAxisAlignment.end : MainAxisAlignment.start,
         children: <Widget>[
-          message.isUser ? const SizedBox() : _buildAvatar(),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Container(
-              constraints: BoxConstraints(
-                maxWidth: MediaQuery.of(context).size.width * 0.8,
-              ),
-              padding: const EdgeInsets.all(12.0),
-              decoration: BoxDecoration(
-                color: const Color(0xFF1a4a7c), // Same as user messages
-                borderRadius: BorderRadius.circular(12.0),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // Display image if available
-                  if (message.hasImage) ...[
-                    _buildImageWidget(context),
-                    if (message.text.isNotEmpty) const SizedBox(height: 8),
-                  ],
-
-                  // Display audio if available
-                  if (message.hasAudio) ...[
-                    _buildAudioWidget(message.audioBytes!),
-                    if (message.text.isNotEmpty) const SizedBox(height: 8),
-                  ],
-
-                  // Display text
-                  if (message.text.isNotEmpty)
-                    MarkdownBody(
-                      data: message.text,
-                      styleSheet: MarkdownStyleSheet(
-                        p: TextStyle(
-                          color: message.isUser ? Colors.white : Colors.white,
-                          fontSize: 14,
-                        ),
-                        code: TextStyle(
-                          backgroundColor:
-                              message.isUser ? const Color(0xFF2a5a8c) : const Color(0xFF404040),
-                          color: Colors.white,
-                        ),
-                        codeblockDecoration: BoxDecoration(
-                          color: message.isUser ? const Color(0xFF2a5a8c) : const Color(0xFF404040),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
+          if (!isUser) _buildAvatar(),
+          if (!isUser) const SizedBox(width: 10),
+          Flexible(
+            child: ClipRRect(
+              borderRadius: BorderRadius.circular(18),
+              child: BackdropFilter(
+                filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                child: Container(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.of(context).size.width * 0.78,
+                  ),
+                  padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                  decoration: BoxDecoration(
+                    color: bubbleTint,
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: bubbleBorder),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.black.withOpacity(0.12),
+                        blurRadius: 10,
+                        offset: const Offset(0, 4),
                       ),
-                    )
-                  else if (!message.hasImage && !message.hasAudio)
-                    const Center(child: CircularProgressIndicator()),
-                ],
+                    ],
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      if (message.hasImage) ...[
+                        _buildImageWidget(context),
+                        if (message.text.isNotEmpty) const SizedBox(height: 8),
+                      ],
+                      if (message.hasAudio) ...[
+                        _buildAudioWidget(message.audioBytes!),
+                        if (message.text.isNotEmpty) const SizedBox(height: 8),
+                      ],
+                      if (message.text.isNotEmpty)
+                        MarkdownBody(
+                          data: message.text,
+                          selectable: true,
+                          styleSheet: MarkdownStyleSheet(
+                            p: const TextStyle(
+                              color: GlassTheme.textPrimary,
+                              fontSize: 14,
+                              height: 1.45,
+                            ),
+                            strong: const TextStyle(
+                              color: GlassTheme.textPrimary,
+                              fontWeight: FontWeight.w700,
+                            ),
+                            listBullet: const TextStyle(
+                              color: GlassTheme.textPrimary,
+                              fontSize: 14,
+                            ),
+                            code: TextStyle(
+                              backgroundColor: codeBg,
+                              color: GlassTheme.textPrimary,
+                              fontFamily: 'monospace',
+                            ),
+                            codeblockDecoration: BoxDecoration(
+                              color: codeBg,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(
+                                  color: Colors.white.withOpacity(0.08)),
+                            ),
+                          ),
+                        )
+                      else if (!message.hasImage && !message.hasAudio)
+                        const Padding(
+                          padding: EdgeInsets.all(4),
+                          child: SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor: AlwaysStoppedAnimation<Color>(
+                                  GlassTheme.accentBlue),
+                            ),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
               ),
             ),
           ),
-          const SizedBox(width: 10),
-          message.isUser ? _buildAvatar() : const SizedBox(),
+          if (isUser) const SizedBox(width: 10),
+          if (isUser) _buildAvatar(),
         ],
       ),
     );
@@ -362,16 +410,49 @@ class ChatMessageWidget extends StatelessWidget {
   }
 
   Widget _buildAvatar() {
-    return message.isUser
-        ? const CircleAvatar(
-            backgroundColor: Color(0xFF1a4a7c),
-            child: Icon(Icons.person, color: Colors.white),
-          )
-        : _circled('assets/gemma.png');
-  }
-
-  Widget _circled(String image) => CircleAvatar(
-        backgroundColor: Colors.transparent,
-        foregroundImage: AssetImage(image),
+    if (message.isUser) {
+      return Container(
+        width: 36,
+        height: 36,
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            colors: [
+              GlassTheme.accentBlue.withOpacity(0.55),
+              GlassTheme.accentPurple.withOpacity(0.45),
+            ],
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+          ),
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white.withOpacity(0.30)),
+        ),
+        child: const Icon(Icons.person, color: Colors.white, size: 18),
       );
+    }
+    // Bot avatar — robot icon on a glass gradient disk.
+    return Container(
+      width: 36,
+      height: 36,
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFF1E2A4E), Color(0xFF0E1A33)],
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+        ),
+        shape: BoxShape.circle,
+        border: Border.all(color: GlassTheme.accentCyan.withOpacity(0.55)),
+        boxShadow: [
+          BoxShadow(
+            color: GlassTheme.accentCyan.withOpacity(0.30),
+            blurRadius: 8,
+          ),
+        ],
+      ),
+      child: const Icon(
+        Icons.smart_toy_rounded,
+        color: GlassTheme.accentCyan,
+        size: 20,
+      ),
+    );
+  }
 }

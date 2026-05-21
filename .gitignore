@@ -51,3 +51,6 @@ config.json
 *.env
 .env.*
 
+
+# Claude Code session metadata (worktrees, transcripts, etc.)
+.claude/

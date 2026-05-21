@@ -31,6 +31,13 @@ class _IngestionWorkflowScreenState extends State<IngestionWorkflowScreen> {
   bool _isImageSource = false;
   String _systemStatus = 'Initializing...';
 
+  // Per-page and per-chunk counters surfaced by ingestDocument so the user
+  // can see "Page 23 of 205" and "Chunk 87 of 412" instead of an opaque %.
+  int _pageCurrent = 0;
+  int _pageTotal = 0;
+  int _chunkCurrent = 0;
+  int _chunkTotal = 0;
+
   @override
   void initState() {
     super.initState();
@@ -130,6 +137,10 @@ class _IngestionWorkflowScreenState extends State<IngestionWorkflowScreen> {
       _step = 0;
       _progress = 0;
       _status = 'Starting...';
+      _pageCurrent = 0;
+      _pageTotal = 0;
+      _chunkCurrent = 0;
+      _chunkTotal = 0;
     });
 
     try {
@@ -141,7 +152,31 @@ class _IngestionWorkflowScreenState extends State<IngestionWorkflowScreen> {
             setState(() {
               _step = step;
               _status = _labelForStep(step);
+              // Coarse progress from step phase. Phase B (embedding) is
+              // refined by onChunkProgress below.
               _progress = (step - 1) / 6.0 + (subStep / 600.0);
+            });
+          }
+        },
+        onPageProgress: (page, total) {
+          if (mounted) {
+            setState(() {
+              _pageCurrent = page;
+              _pageTotal = total;
+            });
+          }
+        },
+        onChunkProgress: (chunk, total) {
+          if (mounted) {
+            setState(() {
+              _chunkCurrent = chunk;
+              _chunkTotal = total;
+              // Phase B covers steps 5-6 of the 6-step pipeline. Map
+              // chunk progress to the back half of the bar so the user
+              // sees real movement during the long embedding stage.
+              if (total > 0) {
+                _progress = (4 / 6.0) + (chunk / total) * (2 / 6.0);
+              }
             });
           }
         },
@@ -412,6 +447,34 @@ class _IngestionWorkflowScreenState extends State<IngestionWorkflowScreen> {
                 ),
               ),
             ),
+            if (_pageTotal > 0 || _chunkTotal > 0) ...[
+              const SizedBox(height: 8),
+              Center(
+                child: Column(
+                  children: [
+                    if (_pageTotal > 0)
+                      Text(
+                        'Page $_pageCurrent of $_pageTotal',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.85),
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                        ),
+                      ),
+                    if (_chunkTotal > 0) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        'Embedded $_chunkCurrent of $_chunkTotal chunks',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.65),
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ],
           ] else
             Row(
               children: [
