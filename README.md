@@ -6,6 +6,14 @@ Designed for students who need a distraction-free, privacy-preserving environmen
 
 ---
 
+## 🎥 Demo
+
+Watch the full walkthrough on YouTube: **[https://youtu.be/dVYz8xq2L_8](https://youtu.be/dVYz8xq2L_8)**
+
+[![Watch the demo](https://img.youtube.com/vi/dVYz8xq2L_8/hqdefault.jpg)](https://youtu.be/dVYz8xq2L_8)
+
+---
+
 ## 🌟 Key Features
 
 - **Local Document Ingestion (RAG)**: Turn PDFs, textbooks, and images into a searchable knowledge base. All chunking, vectorization, and retrieval happen on-device using a local Gecko 512 embedder with per-page + per-chunk progress.
